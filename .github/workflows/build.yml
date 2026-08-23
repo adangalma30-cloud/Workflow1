@@ -1,0 +1,161 @@
+name: Build TikTokBoost APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      ticktokboost_ref:
+        description: "TicktokBoost branch, tag, or commit to build"
+        required: false
+        default: "0.0.1"
+        type: string
+      build_type:
+        description: "APK build type"
+        required: false
+        default: "release"
+        type: choice
+        options:
+          - debug
+          - release
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Android ${{ inputs.build_type || 'release' }} APK
+    runs-on: ubuntu-latest
+
+    env:
+      BUILD_TYPE: ${{ inputs.build_type || 'release' }}
+      APP_REF: ${{ inputs.ticktokboost_ref || '0.0.1' }}
+
+    steps:
+      - name: Check out TicktokBoost
+        uses: actions/checkout@v4
+        with:
+          repository: adangalma30-cloud/TicktokBoost
+          ref: ${{ env.APP_REF }}
+          path: tiktokboost
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          # AGP 8.5.2 / Kotlin 1.9.24 build with Java 17.
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('tiktokboost/**/*.gradle.kts', 'tiktokboost/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Make Gradle wrapper executable
+        working-directory: tiktokboost
+        run: chmod +x gradlew
+
+      - name: Prepare signing keystore (release only)
+        if: env.BUILD_TYPE == 'release'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+            echo "KS_PATH=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
+            echo "KS_ALIAS=${KEY_ALIAS:-release}"              >> "$GITHUB_ENV"
+            echo "KS_PASS=${KEYSTORE_PASSWORD:-android}"       >> "$GITHUB_ENV"
+            echo "KEY_PASS=${KEY_PASSWORD:-android}"           >> "$GITHUB_ENV"
+            echo "::notice::Signing with the keystore from ANDROID_KEYSTORE_BASE64."
+          else
+            echo "::warning::No ANDROID_KEYSTORE_BASE64 secret set - signing with a one-off debug keystore. The APK installs fine, but every run gets a new signature, so uninstall the old app before installing a newer CI build. Add the ANDROID_* secrets for consistent signing."
+            keytool -genkeypair \
+              -keystore "$RUNNER_TEMP/debug.keystore" \
+              -storepass android -keypass android \
+              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+            echo "KS_PATH=$RUNNER_TEMP/debug.keystore" >> "$GITHUB_ENV"
+            echo "KS_ALIAS=androiddebugkey"            >> "$GITHUB_ENV"
+            echo "KS_PASS=android"                     >> "$GITHUB_ENV"
+            echo "KEY_PASS=android"                    >> "$GITHUB_ENV"
+          fi
+
+      - name: Build APK
+        working-directory: tiktokboost
+        run: |
+          # One shell word: the whole -Dorg.gradle.jvmargs value contains spaces.
+          JVM_ARGS='-Dorg.gradle.jvmargs=-Xmx2048m -XX:MaxMetaspaceSize=512m -Dfile.encoding=UTF-8'
+          if [ "$BUILD_TYPE" = "release" ]; then
+            ./gradlew assembleRelease --no-daemon --stacktrace "$JVM_ARGS"
+          else
+            ./gradlew assembleDebug --no-daemon --stacktrace "$JVM_ARGS"
+          fi
+
+      - name: Sign and package APK
+        id: apk
+        working-directory: tiktokboost
+        run: |
+          set -e
+          SAFE_REF="${APP_REF//\//-}"
+          OUT_NAME="TikTokBoost-${SAFE_REF}-${BUILD_TYPE}.apk"
+
+          if [ "$BUILD_TYPE" = "release" ]; then
+            BUILT=$(find app/build/outputs/apk/release -name "*release*.apk" | head -1)
+          else
+            BUILT=$(find app/build/outputs/apk/debug -name "*debug*.apk" | head -1)
+          fi
+          if [ -z "$BUILT" ]; then
+            echo "No APK was produced." >&2
+            exit 1
+          fi
+          echo "Built $BUILT ($(du -h "$BUILT" | cut -f1))"
+
+          if [ "$BUILD_TYPE" = "release" ]; then
+            BT="$ANDROID_HOME/build-tools/34.0.0"
+            "$BT/zipalign" -f 4 "$BUILT" "$RUNNER_TEMP/aligned.apk"
+            "$BT/apksigner" sign \
+              --ks "$KS_PATH" \
+              --ks-pass "pass:$KS_PASS" \
+              --ks-key-alias "$KS_ALIAS" \
+              --key-pass "pass:$KEY_PASS" \
+              --out "$RUNNER_TEMP/$OUT_NAME" \
+              "$RUNNER_TEMP/aligned.apk"
+            "$BT/apksigner" verify "$RUNNER_TEMP/$OUT_NAME"
+          else
+            cp "$BUILT" "$RUNNER_TEMP/$OUT_NAME"
+          fi
+
+          echo "path=$RUNNER_TEMP/$OUT_NAME" >> "$GITHUB_OUTPUT"
+          echo "name=$OUT_NAME"              >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiktokboost-${{ inputs.build_type || 'release' }}-apk
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Gradle reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-reports
+          path: tiktokboost/app/build/reports/
+          if-no-files-found: ignore
+          retention-days: 7
